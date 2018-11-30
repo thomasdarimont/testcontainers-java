@@ -1,0 +1,14 @@
+description = "TestContainers :: keycloak"
+
+ext {
+    keycloakVersion = "4.6.0.Final"
+    resteasyVersion = "3.5.1.Final"
+}
+
+dependencies {
+    compile project(':testcontainers')
+    compile "org.jboss.resteasy:resteasy-client:${resteasyVersion}"
+    compile "org.jboss.resteasy:resteasy-jackson2-provider:${resteasyVersion}"
+    compile "org.keycloak:keycloak-admin-client:${keycloakVersion}"
+    compile "org.keycloak.bom:keycloak-adapter-bom:${keycloakVersion}"
+}
