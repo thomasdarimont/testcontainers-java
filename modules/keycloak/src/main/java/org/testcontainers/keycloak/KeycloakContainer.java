@@ -1,29 +1,26 @@
 package org.testcontainers.keycloak;
 
-import org.keycloak.admin.client.CreatedResponseUtil;
+import lombok.Getter;
 import org.keycloak.admin.client.Keycloak;
 import org.keycloak.admin.client.KeycloakBuilder;
-import org.keycloak.admin.client.resource.RealmResource;
-import org.keycloak.representations.idm.CredentialRepresentation;
-import org.keycloak.representations.idm.UserRepresentation;
 import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.output.Slf4jLogConsumer;
-import org.testcontainers.containers.wait.strategy.HttpWaitStrategy;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitStrategy;
+import org.testcontainers.keycloak.support.KeycloakOperations;
+import org.testcontainers.keycloak.support.KeycloakTemplate;
 import org.testcontainers.utility.Base58;
+import org.testcontainers.utility.MountableFile;
 
-import javax.ws.rs.core.Response;
 import java.time.Duration;
-import java.util.Collections;
 
 import static java.net.HttpURLConnection.HTTP_OK;
 import static java.net.HttpURLConnection.HTTP_UNAUTHORIZED;
-import static java.util.Optional.ofNullable;
 
 /**
  * Represents an keycloak docker instance which exposes by default port 8080.
  * The docker image is by default fetched from jboss/keycloak
  */
+@Getter
 public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
 
     /**
@@ -39,7 +36,7 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
     /**
      * Keycloak Default version
      */
-    public static final String KEYCLOAK_DEFAULT_VERSION = "4.6.0.Final";
+    public static final String KEYCLOAK_DEFAULT_VERSION = "4.7.0.Final";
 
     public static final String DEFAULT_KEYCLOAK_REALM = "master";
 
@@ -53,11 +50,17 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
 
     private Keycloak keycloakAdminClient;
 
+    private KeycloakOperations keycloakOperations;
+
+    private String adminClientId = DEFAULT_ADMIN_CLI_CLIENT_ID;
+
     private String realmName = DEFAULT_KEYCLOAK_REALM;
 
     private String username = DEFAULT_KEYCLOAK_USER;
 
     private String password = DEFAULT_KEYCLOAK_PASSWORD;
+
+    private String importFile;
 
     public KeycloakContainer() {
         this(KEYCLOAK_DEFAULT_IMAGE + ":" + KEYCLOAK_DEFAULT_VERSION);
@@ -72,23 +75,35 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
         super(dockerImageName);
         logger().info("Starting an keycloak container using [{}]", dockerImageName);
         withNetworkAliases("keycloak-" + Base58.randomString(6));
-        withEnv("KEYCLOAK_USER", DEFAULT_KEYCLOAK_USER);
-        withEnv("KEYCLOAK_PASSWORD", DEFAULT_KEYCLOAK_PASSWORD);
         addExposedPorts(KEYCLOAK_DEFAULT_PORT);
         setWaitStrategy(createWaitStrategy());
-        withLogConsumer(new Slf4jLogConsumer(logger()));
+//        withLogConsumer(new Slf4jLogConsumer(logger()));
+    }
+
+    @Override
+    protected void configure() {
+        withEnv("KEYCLOAK_USER", username);
+        withEnv("KEYCLOAK_PASSWORD", password);
+
+        // avoid bootstrap of infinispan clustering
+        withCommand("-c standalone.xml");
+
+        if (importFile != null) {
+
+            String pathInContainer = "/tmp/" + importFile;
+            withCopyFileToContainer(MountableFile.forClasspathResource(importFile), pathInContainer);
+
+            withEnv("KEYCLOAK_IMPORT", pathInContainer);
+        }
     }
 
     private WaitStrategy createWaitStrategy() {
-        return new HttpWaitStrategy()
+
+        return Wait
+            .forHttp(DEFAULT_AUTH_PATH)
             .forPort(KEYCLOAK_DEFAULT_PORT)
-            .forPath(DEFAULT_AUTH_PATH)
             .forStatusCodeMatching(response -> response == HTTP_OK || response == HTTP_UNAUTHORIZED)
             .withStartupTimeout(Duration.ofMinutes(2));
-    }
-
-    public String getServerUrl() {
-        return String.format("%s://%s:%s%s", "http", getContainerIpAddress(), getMappedPort(KEYCLOAK_DEFAULT_PORT), DEFAULT_AUTH_PATH);
     }
 
     public KeycloakContainer withRealm(String realmName) {
@@ -106,60 +121,48 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
         return self();
     }
 
+    public KeycloakContainer withImportFile(String importFile) {
+        this.importFile = importFile;
+        return self();
+    }
+
     @Override
     protected void doStart() {
         super.doStart();
         this.keycloakAdminClient = createKeycloakClient(realmName);
+        this.keycloakOperations = new KeycloakTemplate(keycloakAdminClient, realmName);
+    }
+
+    @Override
+    public void stop() {
+
+        if (this.keycloakAdminClient != null) {
+            this.keycloakAdminClient.close();
+            this.keycloakAdminClient = null;
+        }
+
+        super.stop();
+    }
+
+    protected Keycloak createKeycloakClient(String realmName) {
+        return KeycloakBuilder.builder() //
+            .realm(realmName) //
+            .serverUrl(getAuthServerUrl())
+            .clientId(adminClientId) //
+            .username(username) //
+            .password(password) //
+            .build();
+    }
+
+    public KeycloakOperations getKeycloakOperations() {
+        return keycloakOperations;
     }
 
     public Keycloak getKeycloakAdminClient() {
         return keycloakAdminClient;
     }
 
-    protected Keycloak createKeycloakClient(String realmName) {
-        return KeycloakBuilder.builder() //
-            .realm(realmName) //
-            .serverUrl(getServerUrl())
-            .clientId(DEFAULT_ADMIN_CLI_CLIENT_ID) //
-            .username(username) //
-            .password(password) //
-            .build();
-    }
-
-    public KeycloakUserInfo createUser(KeycloakUser user) {
-        String realm = ofNullable(this.realmName).orElse(DEFAULT_KEYCLOAK_REALM);
-
-        RealmResource realmResource = getKeycloakAdminClient().realm(realm);
-        Response response = realmResource.users().create(toUserRepresentation(user));
-
-        KeycloakUserInfo info = new KeycloakUserInfo();
-        info.setRealm(realm);
-        info.setUsername(user.getUsername());
-        info.setUserId(CreatedResponseUtil.getCreatedId(response));
-
-        return info;
-    }
-
-    protected UserRepresentation toUserRepresentation(KeycloakUser user) {
-
-        UserRepresentation rep = new UserRepresentation();
-
-        rep.setUsername(user.getUsername());
-        rep.setFirstName(user.getFirstname());
-        rep.setLastName(user.getLastname());
-        rep.setEmail(user.getEmail());
-
-        rep.setCredentials(Collections.singletonList(toPasswordCredential(user.getPassword())));
-
-        return rep;
-    }
-
-    protected CredentialRepresentation toPasswordCredential(String password) {
-
-        CredentialRepresentation cred = new CredentialRepresentation();
-        cred.setType(CredentialRepresentation.PASSWORD);
-        cred.setValue(password);
-
-        return cred;
+    public String getAuthServerUrl() {
+        return String.format("http://%s:%s%s", getContainerIpAddress(), getMappedPort(KEYCLOAK_DEFAULT_PORT), DEFAULT_AUTH_PATH);
     }
 }
